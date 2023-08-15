@@ -13,7 +13,10 @@ documentation = "https://docs.rs/cargo-flatpak"
 [dependencies]
 clap = { version = "3.2.22", features = ["derive"] }
 log = "0.4.17"
+reqwest = "0.11.18"
 serde = { version = "1.0.145", features = ["derive"] }
 serde_json = { version = "1.0.85", features = ["preserve_order"] }
+sha2 = "0.10.7"
+shellexpand = "3.1.0"
 toml = { version = "0.5.9", features = ["preserve_order"] }
 url = "2.4.0"

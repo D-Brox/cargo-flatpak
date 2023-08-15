@@ -1,4 +1,7 @@
+use std::{env, io, path::Path};
+
 use clap::Parser;
+use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::lock_file::LockFile;
@@ -57,6 +60,83 @@ fn canonical_url(url: &str) -> Result<Url, url::ParseError> {
     }
 
     Ok(parsed_url)
+}
+
+fn get_git_tarball(repo_url: &str, commit: &str) -> String {
+    let url = canonical_url(repo_url).unwrap();
+    let path = url.path_segments().unwrap().collect::<Vec<_>>();
+    assert!(path.len() == 2);
+    let (owner, repo) = (path[0], path[1]);
+    let hostname = url.host_str().unwrap();
+    match hostname {
+        "github.com" => format!(
+            "https://codeload.{}/{}-{}/tar.gz/{}",
+            hostname, owner, repo, commit
+        ),
+        "bitbucket.org" => format!(
+            "https://{}/{}/{}/get/{}.tar.gz",
+            hostname, owner, repo, commit
+        ),
+        _ if hostname.split('.').next().unwrap() == "gitlab" => format!(
+            "https://{}/{}/{}/-/archive/{}/{}-{}.tar.gz",
+            hostname, owner, repo, commit, repo, commit
+        ),
+        _ => panic!("Don't know how to get tarball for {}", repo_url),
+    }
+}
+
+async fn get_remote_sha256(url: &str) -> String {
+    let mut sha256 = Sha256::new();
+    let data = reqwest::get(url).await.unwrap().bytes().await.unwrap();
+    sha256.update(data);
+    format!("{:x}", sha256.finalize())
+}
+
+fn git_repo_name(git_url: &str, commit: &str) -> Result<String, url::ParseError> {
+    let canonical = canonical_url(git_url)?;
+    let path = canonical.path();
+    let name: &str = path.split('/').last().unwrap_or("");
+    Ok(format!("{}-{}", name, &commit[..COMMIT_LEN]))
+}
+
+fn fetch_git_repo(git_url: &str, commit: &str) -> io::Result<String> {
+    let repo_dir = git_url.replace("://", "_").replace("/", "_");
+
+    let cache_dir = env::var("XDG_CACHE_HOME")
+        .unwrap_or_else(|_| env::var("HOME").unwrap_or_else(|_| String::from("~/.cache")));
+    let cache_dir = shellexpand::tilde(&cache_dir).into_owned();
+
+    let clone_dir = Path::new(&cache_dir).join("flatpak-cargo").join(repo_dir);
+
+    use std::process::Command;
+    if !clone_dir.join(".git").is_dir() {
+        Command::new("git")
+            .args(&["clone", "--depth=1", git_url, clone_dir.to_str().unwrap()])
+            .status()?;
+    }
+
+    let rev_parse_output = Command::new("git")
+        .args(&["rev-parse", "HEAD"])
+        .current_dir(&clone_dir)
+        .output()?;
+
+    let head = String::from_utf8_lossy(&rev_parse_output.stdout)
+        .trim()
+        .to_string();
+
+    if &head[..COMMIT_LEN] != &commit[..COMMIT_LEN] {
+        Command::new("git")
+            .args(&["fetch", "origin", commit])
+            .current_dir(&clone_dir)
+            .status()?;
+
+        Command::new("git")
+            .args(&["checkout", commit])
+            .current_dir(&clone_dir)
+            .status()?;
+    }
+
+    Ok(clone_dir.to_str().unwrap().to_string())
 }
 
 fn get_git_package_sources(package: &lock_file::Package) -> manifest::Source {
