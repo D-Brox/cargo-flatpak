@@ -23,6 +23,11 @@ pub struct Git {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct Shell {
+    pub commands: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum Source {
     #[serde(rename = "archive")]
@@ -31,6 +36,8 @@ pub enum Source {
     Inline(Inline),
     #[serde(rename = "git")]
     Git(Git),
+    #[serde(rename = "shell")]
+    Shell(Shell),
 }
 
 #[test]

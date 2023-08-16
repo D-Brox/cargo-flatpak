@@ -1,4 +1,11 @@
-use std::{env, io, path::Path};
+use std::{
+    collections::HashMap,
+    env,
+    future::Future,
+    io,
+    path::{Path, PathBuf},
+    pin::Pin,
+};
 
 use clap::Parser;
 use sha2::{Digest, Sha256};
@@ -13,6 +20,7 @@ const CRATES_IO: &str = "https://static.crates.io/crates";
 const CARGO_HOME: &str = "cargo";
 const CARGO_CRATES: &str = "cargo/vendor";
 const VENDORED_SOURCES: &str = "vendored-sources";
+const GIT_CACHE: &str = "flatpak-cargo/git";
 const COMMIT_LEN: usize = 7;
 
 /// Simple program to greet a person
@@ -139,7 +147,232 @@ fn fetch_git_repo(git_url: &str, commit: &str) -> io::Result<String> {
     Ok(clone_dir.to_str().unwrap().to_string())
 }
 
-fn get_git_package_sources(package: &lock_file::Package) -> manifest::Source {
+#[derive(serde::Serialize)]
+struct GitPackage {
+    path: PathBuf,
+    package: toml::Value,
+    workspace: Option<toml::Value>,
+}
+
+impl GitPackage {
+    pub fn normalized(&self) -> toml::Value {
+        let mut package = self.package.clone();
+        if let Some(workspace) = &self.workspace {
+            for (section_key, section) in package.as_table_mut().unwrap().iter_mut() {
+                if let toml::Value::Table(section_map) = section {
+                    let mut keys_to_replace = Vec::new();
+                    for (key, value) in section_map.iter() {
+                        if let toml::Value::Table(value_map) = value {
+                            if value_map.contains_key("workspace") {
+                                keys_to_replace.push(key.clone());
+                            }
+                        }
+                    }
+                    if let Some(workspace_section) =
+                        workspace.get(section_key).and_then(toml::Value::as_table)
+                    {
+                        for key in keys_to_replace {
+                            if let Some(workspace_value) = workspace_section.get(&key) {
+                                section_map.insert(key, workspace_value.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        package
+    }
+}
+
+type GitPackagesType = HashMap<String, GitPackage>;
+
+async fn get_cargo_toml_packages(
+    root_toml: toml::Value,
+    root_dir: impl AsRef<Path>,
+) -> anyhow::Result<GitPackagesType> {
+    let root_dir = root_dir.as_ref();
+    assert!(root_toml.get("package").is_some() || root_toml.get("workspace").is_some());
+    let mut packages: GitPackagesType = HashMap::new();
+
+    fn get_dep_packages<'a>(
+        entry: &'a toml::Value,
+        toml_dir: &'a Path,
+        workspace: Option<&'a toml::Value>,
+        packages: &'a mut GitPackagesType,
+        root_dir: &'a Path,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + 'a>> {
+        Box::pin(async move {
+            // TODO: Use proper serde deserializer
+            if let Some(dependencies) = entry.get("dependencies").and_then(|d| d.as_table()) {
+                for (dep_name, dep) in dependencies {
+                    let mut dep_name = dep_name.to_string();
+                    if let Some(package) = dep.get("package").and_then(|p| p.as_str()) {
+                        dep_name = package.to_string();
+                    }
+                    if dep.get("path").is_none() {
+                        continue;
+                    }
+                    if packages.contains_key(&dep_name) {
+                        continue;
+                    }
+                    let dep_dir = pathdiff::diff_paths(
+                        toml_dir.join(dep.get("path").and_then(|p| p.as_str()).unwrap()),
+                        Path::new("."),
+                    )
+                    .unwrap();
+                    log::debug!("Loading dependency {} from {:?}", dep_name, dep_dir);
+                    let dep_toml: toml::Value = toml::from_str(
+                        &std::fs::read_to_string(dep_dir.join("Cargo.toml")).unwrap(),
+                    )?;
+                    assert_eq!(
+                        dep_toml
+                            .get("package")
+                            .and_then(|p| p.get("name"))
+                            .and_then(|n| n.as_str()),
+                        Some(dep_name.as_str())
+                    );
+
+                    get_dep_packages(&dep_toml, &dep_dir, workspace, packages, root_dir).await?;
+
+                    packages.insert(
+                        dep_name,
+                        GitPackage {
+                            path: dep_dir,
+                            package: dep.clone(),
+                            workspace: workspace.cloned(),
+                        },
+                    );
+                }
+            }
+            if let Some(targets) = entry.get("target").and_then(|t| t.as_table()) {
+                for target in targets.values() {
+                    get_dep_packages(target, toml_dir, workspace, packages, root_dir).await?;
+                }
+            }
+
+            Ok(())
+        })
+    }
+
+    if let Some(package) = root_toml.get("package") {
+        get_dep_packages(&root_toml, &root_dir, None, &mut packages, root_dir).await?;
+        packages.insert(
+            package
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap()
+                .to_string(),
+            GitPackage {
+                path: root_dir.to_path_buf(),
+                package: root_toml.clone(),
+                workspace: None,
+            },
+        );
+    }
+
+    if let Some(workspace) = root_toml.get("workspace") {
+        if let Some(members) = workspace.get("members").and_then(|m| m.as_array()) {
+            for member in members.iter().filter_map(|m| m.as_str()) {
+                for subpkg_toml in glob::glob(&format!(
+                    "{}/{}/Cargo.toml",
+                    root_dir.to_string_lossy(),
+                    member
+                ))? {
+                    match subpkg_toml {
+                        Ok(path) => {
+                            let subpkg = path.parent().unwrap();
+                            log::debug!("Loading workspace member {:?} in {:?}", path, root_dir);
+                            let pkg_toml: toml::Value =
+                                toml::from_str(&std::fs::read_to_string(&path).unwrap())?;
+                            get_dep_packages(
+                                &pkg_toml,
+                                &subpkg,
+                                Some(workspace),
+                                &mut packages,
+                                root_dir,
+                            )
+                            .await?;
+                            packages.insert(
+                                pkg_toml
+                                    .get("package")
+                                    .and_then(|p| p.get("name"))
+                                    .and_then(|n| n.as_str())
+                                    .unwrap()
+                                    .to_string(),
+                                GitPackage {
+                                    path: subpkg.to_path_buf(),
+                                    package: pkg_toml,
+                                    workspace: Some(workspace.clone()),
+                                },
+                            );
+                        }
+                        Err(e) => eprintln!("{:?}", e),
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(packages)
+}
+
+fn load_toml(src: &str) -> toml::Value {
+    toml::from_str(src).unwrap()
+}
+
+async fn get_git_repo_packages(
+    git_url: &str,
+    commit: &str,
+) -> Result<GitPackagesType, Box<dyn std::error::Error>> {
+    log::info!("Loading packages from {}", git_url);
+    let git_repo_dir = fetch_git_repo(git_url, commit)?;
+    let mut packages: GitPackagesType = HashMap::new();
+
+    let cargo_toml_path = Path::new(&git_repo_dir).join("Cargo.toml");
+
+    let current_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&git_repo_dir).unwrap();
+
+    if cargo_toml_path.exists() {
+        let toml_content = std::fs::read_to_string(&cargo_toml_path).unwrap();
+        let packages_from_toml = get_cargo_toml_packages(load_toml(&toml_content), ".").await?;
+        packages.extend(packages_from_toml);
+    } else {
+        let pattern = format!("{}/Cargo.toml", &git_repo_dir);
+        for entry in glob::glob(&pattern)? {
+            match entry {
+                Ok(path) => {
+                    let toml_content = std::fs::read_to_string(&path).unwrap();
+                    let parent_dir = path.parent().unwrap();
+                    let packages_from_toml = get_cargo_toml_packages(
+                        load_toml(&toml_content),
+                        parent_dir.to_string_lossy().as_ref(),
+                    )
+                    .await?;
+                    packages.extend(packages_from_toml);
+                }
+                Err(e) => println!("{:?}", e),
+            }
+        }
+    }
+
+    std::env::set_current_dir(&current_dir).unwrap();
+
+    assert!(
+        !packages.is_empty(),
+        "No packages found in {}",
+        git_repo_dir
+    );
+    log::debug!(
+        "Packages in {}:\n{}",
+        git_url,
+        serde_json::to_string_pretty(&packages)?
+    );
+
+    Ok(packages)
+}
+
+async fn get_git_package_sources(package: &lock_file::Package) -> Vec<manifest::Source> {
     let name = package.name.clone();
     let source = package.source.clone().unwrap();
 
@@ -150,22 +383,49 @@ fn get_git_package_sources(package: &lock_file::Package) -> manifest::Source {
         .expect("The commit needs to be indicated in the fragement part");
 
     let canonical = canonical_url(&source).unwrap();
-    let name = canonical.path_segments().unwrap().last().unwrap();
     let repo_url = canonical.to_string();
 
+    let packages = get_git_repo_packages(&repo_url, &commit).await.unwrap();
+
     let dest = format!("{name}-{}", &commit[..COMMIT_LEN]);
-    eprintln!("{dest}");
 
-    dbg!(&repo_url);
+    let git_pkg = &packages.get(&name).unwrap();
+    let pkg_repo_dir = format!(
+        "{GIT_CACHE}/{}/{}",
+        git_repo_name(&repo_url, &commit).unwrap(),
+        git_pkg.path.to_string_lossy(),
+    );
+    dbg!(&pkg_repo_dir);
 
-    manifest::Source::Git(manifest::Git {
+    let shell = manifest::Source::Shell(manifest::Shell {
+        commands: vec![format!(
+            r#"cp -r --reflink=auto "{pkg_repo_dir}" "{CARGO_CRATES}/{name}""#
+        )],
+    });
+
+    let cargo_toml = manifest::Source::Inline(manifest::Inline {
+        contents: toml::to_string(&git_pkg.normalized()).unwrap(),
+        dest: format!("{CARGO_CRATES}/{name}"),
+        dest_filename: "Cargo.toml".to_string(),
+    });
+
+    let cargo_checksum = manifest::Source::Inline(manifest::Inline {
+        contents: r#"{"package": null, "files": {}}"#.to_string(),
+        dest: format!("{CARGO_CRATES}/{name}"),
+        dest_filename: ".cargo-checksum.json".to_string(),
+    });
+
+    let git = manifest::Source::Git(manifest::Git {
         url: repo_url,
         commit,
         dest,
-    })
+    });
+
+    // vec![git, shell, cargo_toml, cargo_checksum]
+    vec![shell, cargo_toml, cargo_checksum]
 }
 
-fn get_package_sources(
+async fn get_package_sources(
     package: &lock_file::Package,
 ) -> Option<(Vec<manifest::Source>, toml::map::Map<String, toml::Value>)> {
     let name = &package.name;
@@ -173,10 +433,10 @@ fn get_package_sources(
 
     if let Some(source) = package.source.as_ref() {
         if source.starts_with("git+") {
-            let source = get_git_package_sources(package);
+            let source = get_git_package_sources(package).await;
 
             let c = toml::map::Map::new();
-            return Some((vec![source], c));
+            return Some((source, c));
         }
 
         if let Some(checksum) = package.checksum.as_ref() {
@@ -225,13 +485,17 @@ fn main() {
     });
 
     for package in cargo_lock.package {
-        if let Some((mut pkg_sources, cargo_vendored_entry)) = get_package_sources(&package) {
-            package_sources.append(&mut pkg_sources);
+        pollster::block_on(async {
+            if let Some((mut pkg_sources, cargo_vendored_entry)) =
+                get_package_sources(&package).await
+            {
+                package_sources.append(&mut pkg_sources);
 
-            for (key, value) in cargo_vendored_entry {
-                cargo_vendored_sources.insert(key, value);
+                for (key, value) in cargo_vendored_entry {
+                    cargo_vendored_sources.insert(key, value);
+                }
             }
-        }
+        });
     }
 
     let mut sources = package_sources.clone();
