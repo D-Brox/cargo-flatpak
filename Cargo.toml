@@ -1,6 +1,6 @@
 [package]
-name = "cargo-flatpack"
-version = "0.0.0"
+name = "cargo-flatpak"
+version = "0.0.1"
 edition = "2021"
 
 authors = ["Poly <marynczak.bartlomiej@gmail.com>"]
@@ -12,16 +12,12 @@ documentation = "https://docs.rs/cargo-flatpak"
 
 [dependencies]
 anyhow = "1.0.74"
-clap = { version = "3.2.22", features = ["derive"] }
+cargo_metadata = "0.18.1"
+clap = { version = "4.5.16", features = ["derive"] }
 glob = "0.3.1"
 log = "0.4.17"
 pathdiff = "0.2.1"
-pollster = "0.3.0"
-reqwest = "0.11.18"
 serde = { version = "1.0.145", features = ["derive"] }
 serde_json = { version = "1.0.85", features = ["preserve_order"] }
-sha2 = "0.10.7"
-shellexpand = "3.1.0"
-tempfile = "3.7.1"
-toml = { version = "0.5.9", features = ["preserve_order"] }
+toml = { version = "0.8.19", features = ["preserve_order"] }
 url = "2.4.0"
